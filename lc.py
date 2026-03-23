@@ -55,8 +55,8 @@ class LCClient:
     def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None):
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not self.api_key:
-            print("Error: No API key provided. Set OPENAI_API_KEY or use --api-key.", file=sys.stderr)
-            sys.exit(1)
+            print("Warning: No API key provided. Set OPENAI_API_KEY or use --api-key. Using dummy key.", file=sys.stderr)
+            self.api_key = "sk-123"
 
         if base_url and not base_url.rstrip("/").endswith("/v1"):
             base_url = base_url.rstrip("/") + "/v1"
@@ -87,7 +87,11 @@ class LCClient:
     ) -> Generator[Dict[str, Any], None, None]:
         """Append a user message and stream a response."""
         self.messages.append({"role": "user", "content": message})
-        return self._stream(tools)
+        try:
+            yield from self._stream(tools)
+        except Exception:
+            self.messages.pop()
+            raise
 
     def _build_system_prompt(self) -> Optional[str]:
         """Build system prompt with dynamic environment info."""
@@ -137,27 +141,24 @@ class LCClient:
     ) -> Generator[Dict[str, Any], None, None]:
         """Stream a completion from the current messages."""
         start_time = time.time()
-        try:
-            messages = self.messages
-            system_prompt = self._build_system_prompt()
-            if system_prompt:
-                messages = [{"role": "system", "content": system_prompt}] + messages
-            stream = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                tools=tools,
-                tool_choice="auto",
-                stream=True,
-                stream_options={"include_usage": True},
-                extra_body={"cache_prompt": True},
-            )
-            for chunk in stream:
-                yield {
-                    "chunk": chunk,
-                    "elapsed": time.time() - start_time,
-                }
-        except Exception as e:
-            raise
+        messages = self.messages
+        system_prompt = self._build_system_prompt()
+        if system_prompt:
+            messages = [{"role": "system", "content": system_prompt}] + messages
+        stream = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            tools=tools,
+            tool_choice="auto",
+            stream=True,
+            stream_options={"include_usage": True},
+            extra_body={"cache_prompt": True},
+        )
+        for chunk in stream:
+            yield {
+                "chunk": chunk,
+                "elapsed": time.time() - start_time,
+            }
 
     def get_current_time(self) -> str:
         """Get current time formatted."""
@@ -371,6 +372,18 @@ class ToolRegistry:
                                 "type": "string",
                                 "description": "Glob pattern to filter which files to search (e.g., '*.py', '*.{js,ts}')",
                             },
+                            "context_before": {
+                                "type": "integer",
+                                "description": "Number of lines to show before each match (like grep -B)",
+                            },
+                            "context_after": {
+                                "type": "integer",
+                                "description": "Number of lines to show after each match (like grep -A)",
+                            },
+                            "context": {
+                                "type": "integer",
+                                "description": "Number of lines to show before and after each match (like grep -C). Overridden by context_before/context_after if also set.",
+                            },
                         },
                         "required": ["pattern"],
                     },
@@ -439,6 +452,35 @@ class ToolRegistry:
                     },
                 },
             },
+            "grepai": {
+                "type": "function",
+                "function": {
+                    "name": "grepai",
+                    "description": "Semantic code search and call graph tracing using grepai. "
+                    "Use this as the PRIMARY tool for code exploration — prefer over grep/glob for intent-based queries. "
+                    "Supports: 'search' for semantic code search, 'trace_callers' to find all callers of a symbol, "
+                    "'trace_callees' to find all functions called by a symbol, 'trace_graph' for a full call graph.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {
+                                "type": "string",
+                                "enum": ["search", "trace_callers", "trace_callees", "trace_graph"],
+                                "description": "The grepai command: 'search' for semantic search, 'trace_callers'/'trace_callees'/'trace_graph' for call graph analysis",
+                            },
+                            "query": {
+                                "type": "string",
+                                "description": "For search: a natural language description of what to find (e.g., 'user authentication flow'). For trace commands: the symbol name (e.g., 'HandleRequest')",
+                            },
+                            "depth": {
+                                "type": "integer",
+                                "description": "Depth for trace_graph command (default: 3). Ignored for other commands.",
+                            },
+                        },
+                        "required": ["command", "query"],
+                    },
+                },
+            },
         }
         self.requires_approval = {"write_file", "edit_file", "run_command"}
 
@@ -475,6 +517,8 @@ class ToolRegistry:
             return self._list_directory(arguments)
         elif tool_name == "render_mermaid":
             return self._render_mermaid(arguments)
+        elif tool_name == "grepai":
+            return self._grepai(arguments)
         else:
             return f"Unknown tool: {tool_name}"
 
@@ -594,6 +638,7 @@ class ToolRegistry:
 
     def _glob(self, arguments: Dict) -> str:
         """Find files matching a glob pattern."""
+        import pathlib
         pattern = arguments.get("pattern", "")
         if not pattern:
             return "Error: No pattern provided"
@@ -601,17 +646,21 @@ class ToolRegistry:
         base = os.path.abspath(base)
         if not os.path.isdir(base):
             return f"Error: Not a directory: {base}"
+        base_path = pathlib.Path(base)
+        # Simple patterns (no path separators) search recursively;
+        # patterns with paths use exact path-aware matching.
+        if "/" in pattern or os.sep in pattern:
+            iterator = base_path.glob(pattern)
+        else:
+            iterator = base_path.rglob(pattern)
         matches = []
-        for root, dirs, files in os.walk(base):
-            # skip hidden dirs
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
-            for name in files:
-                full = os.path.join(root, name)
-                rel = os.path.relpath(full, base)
-                if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(name, pattern):
-                    matches.append(rel)
-                if len(matches) >= 200:
-                    break
+        for p in iterator:
+            if not p.is_file():
+                continue
+            rel = p.relative_to(base_path)
+            if any(part.startswith(".") for part in rel.parts):
+                continue
+            matches.append(str(rel))
             if len(matches) >= 200:
                 break
         if not matches:
@@ -629,14 +678,18 @@ class ToolRegistry:
         base = arguments.get("path", os.getcwd())
         base = os.path.abspath(base)
         include = arguments.get("include", "")
+        ctx = arguments.get("context", 0)
+        before = arguments.get("context_before", ctx)
+        after = arguments.get("context_after", ctx)
         try:
             regex = re.compile(pattern)
         except re.error as e:
             return f"Error: Invalid regex: {e}"
-        matches = []
+        results = []
         max_matches = 100
+        match_count = [0]
         if os.path.isfile(base):
-            self._grep_file(base, regex, os.path.dirname(base), matches, max_matches)
+            self._grep_file(base, regex, os.path.dirname(base), results, max_matches, match_count, before, after)
         elif os.path.isdir(base):
             for root, dirs, files in os.walk(base):
                 dirs[:] = [d for d in dirs if not d.startswith(".")]
@@ -644,30 +697,52 @@ class ToolRegistry:
                     if include and not fnmatch.fnmatch(name, include):
                         continue
                     full = os.path.join(root, name)
-                    self._grep_file(full, regex, base, matches, max_matches)
-                    if len(matches) >= max_matches:
+                    self._grep_file(full, regex, base, results, max_matches, match_count, before, after)
+                    if match_count[0] >= max_matches:
                         break
-                if len(matches) >= max_matches:
+                if match_count[0] >= max_matches:
                     break
         else:
             return f"Error: Path not found: {base}"
-        if not matches:
+        if not results:
             return f"No matches for '{pattern}'"
-        result = "\n".join(matches)
-        if len(matches) >= max_matches:
+        result = "\n".join(results)
+        if match_count[0] >= max_matches:
             result += "\n... (truncated at 100 matches)"
         return result
 
-    def _grep_file(self, filepath: str, regex, base: str, matches: List[str], limit: int):
+    def _grep_file(self, filepath: str, regex, base: str, results: List[str], limit: int,
+                   match_count: List[int], before: int = 0, after: int = 0):
         """Search a single file for regex matches."""
         try:
             with open(filepath, "r", errors="ignore") as f:
                 rel = os.path.relpath(filepath, base)
-                for lineno, line in enumerate(f, 1):
-                    if len(matches) >= limit:
-                        return
-                    if regex.search(line):
-                        matches.append(f"{rel}:{lineno}: {line.rstrip()[:200]}")
+                if before > 0 or after > 0:
+                    lines = f.readlines()
+                    last_printed = -1
+                    for lineno_idx, line in enumerate(lines):
+                        if match_count[0] >= limit:
+                            return
+                        if regex.search(line):
+                            match_count[0] += 1
+                            start = max(0, lineno_idx - before)
+                            end = min(len(lines), lineno_idx + after + 1)
+                            if last_printed >= 0 and start > last_printed + 1:
+                                results.append("--")
+                            for i in range(start, end):
+                                if i <= last_printed:
+                                    continue
+                                ln = i + 1
+                                marker = ":" if i == lineno_idx else "-"
+                                results.append(f"{rel}{marker}{ln}{marker} {lines[i].rstrip()[:200]}")
+                                last_printed = i
+                else:
+                    for lineno, line in enumerate(f, 1):
+                        if match_count[0] >= limit:
+                            return
+                        if regex.search(line):
+                            match_count[0] += 1
+                            results.append(f"{rel}:{lineno}: {line.rstrip()[:200]}")
         except (OSError, UnicodeDecodeError):
             pass
 
@@ -851,6 +926,52 @@ class ToolRegistry:
         except Exception as e:
             return f"Error rendering mermaid: {str(e)}"
 
+    def _grepai(self, arguments: Dict) -> str:
+        """Run grepai for semantic code search or call graph tracing."""
+        command = arguments.get("command", "")
+        query = arguments.get("query", "")
+        if not command:
+            return "Error: No command provided"
+        if not query:
+            return "Error: No query provided"
+
+        grepai = shutil.which("grepai")
+        if not grepai:
+            return "Error: grepai is not installed or not on PATH. Install it and try again."
+
+        try:
+            if command == "search":
+                cmd = [grepai, "search", query, "--json", "--compact"]
+            elif command == "trace_callers":
+                cmd = [grepai, "trace", "callers", query, "--json"]
+            elif command == "trace_callees":
+                cmd = [grepai, "trace", "callees", query, "--json"]
+            elif command == "trace_graph":
+                depth = str(arguments.get("depth", 3))
+                cmd = [grepai, "trace", "graph", query, "--depth", depth, "--json"]
+            else:
+                return f"Error: Unknown grepai command: {command}"
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                cwd=os.getcwd(),
+            )
+            output = []
+            if result.stdout:
+                output.append(result.stdout)
+            if result.stderr:
+                output.append(f"STDERR:\n{result.stderr}")
+            if result.returncode != 0:
+                output.append(f"Exit code: {result.returncode}")
+            return "\n".join(output) if output else "No results found"
+        except subprocess.TimeoutExpired:
+            return "Error: grepai command timed out after 60 seconds"
+        except Exception as e:
+            return f"Error running grepai: {str(e)}"
+
     def get_tools_list(self) -> Table:
         """Get a list of available tools."""
         table = Table(
@@ -920,8 +1041,9 @@ def _get_tool_path(tool_name: str, arguments: Dict) -> Optional[str]:
         p = arguments.get("path", "")
     elif tool_name == "write_file":
         p = arguments.get("filename", "")
-        if p and "/" not in p and ".." not in p:
-            p = os.path.join(os.getcwd(), p)
+        if not p or "/" in p or ".." in p:
+            return None
+        p = os.path.join(os.getcwd(), p)
     else:
         return None
     return os.path.abspath(p) if p else None
@@ -1506,9 +1628,7 @@ def main():
                 print_status()
 
                 # Build assistant message for history
-                assistant_message: Dict[str, Any] = {"role": "assistant"}
-                if content_chunks:
-                    assistant_message["content"] = "".join(content_chunks)
+                assistant_message: Dict[str, Any] = {"role": "assistant", "content": "".join(content_chunks) if content_chunks else ""}
                 if tool_calls_data:
                     assistant_message["tool_calls"] = [
                         {
